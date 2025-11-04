@@ -30,7 +30,60 @@ if sudo -u postgres ${PG_BIN}/pg_isready -p ${DB_PORT} > /dev/null 2>&1; then
     fi
     
     echo ""
-    echo "Script stopped - server already running."
+    echo "Applying schema migrations to running server..."
+
+    # Ensure pgcrypto extension and permissions then run schema files
+    sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d postgres << EOF
+-- Create user if doesn't exist
+DO \$\$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${DB_USER}') THEN
+        CREATE ROLE ${DB_USER} WITH LOGIN PASSWORD '${DB_PASSWORD}';
+    END IF;
+    ALTER ROLE ${DB_USER} WITH PASSWORD '${DB_PASSWORD}';
+END
+\$\$;
+
+-- Create DB if not exists
+DO \$\$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = '${DB_NAME}') THEN
+        PERFORM dblink_exec('dbname=' || current_database(), 'CREATE DATABASE ${DB_NAME}');
+    END IF;
+END
+\$\$ LANGUAGE plpgsql;
+EOF
+
+    # If dblink is missing, create DB using createdb
+    sudo -u postgres ${PG_BIN}/createdb -p ${DB_PORT} ${DB_NAME} 2>/dev/null || true
+
+    # Ensure extension and permissions in target DB
+    sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} << EOF
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+GRANT USAGE ON SCHEMA public TO ${DB_USER};
+GRANT CREATE ON SCHEMA public TO ${DB_USER};
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO ${DB_USER};
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO ${DB_USER};
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO ${DB_USER};
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TYPES TO ${DB_USER};
+GRANT ALL ON SCHEMA public TO ${DB_USER};
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ${DB_USER};
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ${DB_USER};
+GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO ${DB_USER};
+EOF
+
+    echo "Applying schema migrations..."
+    for file in schema/001_init.sql schema/002_indexes.sql schema/003_seed_rbac.sql; do
+      if [ -f "$file" ]; then
+        echo " - Running $file"
+        sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -f "$file"
+      else
+        echo " ! Skipping missing file: $file"
+      fi
+    done
+
+    echo "Schema migrations applied to running server."
     exit 0
 fi
 
@@ -42,6 +95,15 @@ if pgrep -f "postgres.*-p ${DB_PORT}" > /dev/null 2>&1; then
     # Try to connect and verify the database exists
     if sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -c '\q' 2>/dev/null; then
         echo "Database ${DB_NAME} is accessible."
+        echo "Applying schema migrations..."
+        for file in schema/001_init.sql schema/002_indexes.sql schema/003_seed_rbac.sql; do
+          if [ -f "$file" ]; then
+            echo " - Running $file"
+            sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -f "$file"
+          else
+            echo " ! Skipping missing file: $file"
+          fi
+        done
         echo "Script stopped - server already running."
         exit 0
     fi
@@ -91,7 +153,10 @@ END
 GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};
 
 -- Connect to the specific database for schema-level permissions
-\c ${DB_NAME}
+\\c ${DB_NAME}
+
+-- Ensure required extensions exist (for UUIDs and cryptographic functions)
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- For PostgreSQL 15+, we need to handle public schema permissions differently
 -- First, grant usage on public schema
@@ -106,10 +171,6 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TYPES TO ${DB_USER};
 
--- If you want the user to be able to create objects without restrictions,
--- you can make them the owner of the public schema (optional but effective)
--- ALTER SCHEMA public OWNER TO ${DB_USER};
-
 -- Alternative: Grant all privileges on schema public to the user
 GRANT ALL ON SCHEMA public TO ${DB_USER};
 
@@ -119,6 +180,17 @@ GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ${DB_USER};
 GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO ${DB_USER};
 EOF
 
+# Apply schema SQL files (in order) after DB is ready
+echo "Applying schema migrations..."
+for file in schema/001_init.sql schema/002_indexes.sql schema/003_seed_rbac.sql; do
+  if [ -f "$file" ]; then
+    echo " - Running $file"
+    sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -f "$file"
+  else
+    echo " ! Skipping missing file: $file"
+  fi
+done
+
 # Additionally, connect to the specific database to ensure permissions
 sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} << EOF
 -- Double-check permissions are set correctly in the target database
@@ -126,7 +198,7 @@ GRANT ALL ON SCHEMA public TO ${DB_USER};
 GRANT CREATE ON SCHEMA public TO ${DB_USER};
 
 -- Show current permissions for debugging
-\dn+ public
+\\dn+ public
 EOF
 
 # Save connection command to a file
